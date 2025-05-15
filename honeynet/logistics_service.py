@@ -305,15 +305,25 @@ MAIN_PAGE = '''
 '''
 
 
-def from_database_import():
-    """Importuje funkcje z modułu db_handler."""
-    # Dodajemy ścieżkę do modułu bazy danych
+def import_db_handler():
+    """Importuje moduł db_handler."""
     import sys
+    import os
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    from honeynet.db_handler import log_attack
-
-    return log_attack
+    
+    try:
+        from honeynet.db_handler import log_attack
+        return log_attack
+    except ImportError as e:
+        logger.error(f"Nie można zaimportować modułu db_handler: {e}")
+        
+        # Funkcja zastępcza w przypadku braku możliwości importu
+        def fallback_log_attack(db_path, attack_data):
+            logger.warning("Używam zastępczej funkcji log_attack!")
+            logger.info(f"Atak: {attack_data.get('attack_type')} z {attack_data.get('source_ip')}")
+            return None
+            
+        return fallback_log_attack
 
 
 def init_logistics_db():
@@ -359,8 +369,7 @@ def init_logistics_db():
         name TEXT NOT NULL,
         start_point TEXT NOT NULL,
         end_point TEXT NOT NULL,
-        distance REAL,
-        estimated_time INTEGER,
+        distance REAL,estimated_time INTEGER,
         status TEXT,
         last_update TEXT
     )
@@ -504,7 +513,7 @@ def log_sql_injection_attempt(source_ip, source_port, payload, technique, path, 
         path (str): Ścieżka HTTP, na której wykryto atak
         success_status (int): Status wykonania ataku (0 - nieudany, 1 - udany)
     """
-    log_attack = from_database_import()
+    log_attack = import_db_handler()
 
     attack_data = {
         'timestamp': datetime.now().isoformat(),
@@ -556,9 +565,10 @@ def log_sql_injection_attempt(source_ip, source_port, payload, technique, path, 
     # Symulacja wyciągnięcia danych (w prawdziwym ataku)
     if success_status:
         attack_data['sql_injection_details']['extracted_data'] = 'User accounts, routes, vehicle locations'
-
-    log_attack(DB_PATH, attack_data)
-    logger.warning(f"Wykryto próbę SQL Injection z {source_ip}:{source_port} - Technika: {technique}")
+        
+    # Logowanie wykrytego ataku
+    attack_id = log_attack(DB_PATH, attack_data)
+    logger.warning(f"Wykryto próbę SQL Injection z {source_ip}:{source_port} - Technika: {technique}, ID: {attack_id}")
 
 
 def get_logistics_db():
@@ -674,8 +684,9 @@ def login():
             }
         }
 
-        log_attack = from_database_import()
-        log_attack(DB_PATH, attack_data)
+        log_attack = import_db_handler()
+        attack_id = log_attack(DB_PATH, attack_data)
+        logger.warning(f"Wykryto SQL Injection w logowaniu z {source_ip} - Metoda: {technique}, ID: {attack_id}")
 
         # Symulacja podatnej odpowiedzi
         return jsonify({
@@ -749,8 +760,9 @@ def search():
             }
         }
 
-        log_attack = from_database_import()
-        log_attack(DB_PATH, attack_data)
+        log_attack = import_db_handler()
+        attack_id = log_attack(DB_PATH, attack_data)
+        logger.warning(f"Wykryto SQL Injection w wyszukiwaniu z {source_ip} - Metoda: {technique}, ID: {attack_id}")
 
         # Symulacja podatnej odpowiedzi z danymi
         return jsonify({
@@ -834,8 +846,9 @@ def get_route(route_id):
             }
         }
 
-        log_attack = from_database_import()
-        log_attack(DB_PATH, attack_data)
+        log_attack = import_db_handler()
+        attack_id = log_attack(DB_PATH, attack_data)
+        logger.warning(f"Wykryto SQL Injection w API tras z {source_ip} - Metoda: {technique}, ID: {attack_id}")
 
         # Symulacja błędu SQL
         return jsonify({

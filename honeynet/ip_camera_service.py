@@ -245,15 +245,25 @@ CAMERA_MAIN_PAGE = '''
 '''
 
 
-def from_database_import():
-    """Importuje funkcje z modułu db_handler."""
-    # Dodajemy ścieżkę do modułu bazy danych
+def import_db_handler():
+    """Importuje moduł db_handler."""
     import sys
+    import os
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    from honeynet.db_handler import log_attack
-
-    return log_attack
+    
+    try:
+        from honeynet.db_handler import log_attack
+        return log_attack
+    except ImportError as e:
+        logger.error(f"Nie można zaimportować modułu db_handler: {e}")
+        
+        # Funkcja zastępcza w przypadku braku możliwości importu
+        def fallback_log_attack(db_path, attack_data):
+            logger.warning("Używam zastępczej funkcji log_attack!")
+            logger.info(f"Atak: {attack_data.get('attack_type')} z {attack_data.get('source_ip')}")
+            return None
+            
+        return fallback_log_attack
 
 
 def reset_stats():
@@ -295,6 +305,10 @@ def detect_ddos(source_ip, source_port):
         connection_stats['total_connections'] += 1
         connection_stats['active_connections'] += 1
         connection_stats['source_ips'].add(source_ip)
+        
+        # Aktualizacja statystyki ruchu
+        request_size = len(request.data) if request.data else 0
+        connection_stats['traffic_volume'] += request_size
 
         current_time = time.time()
         elapsed = current_time - connection_stats['last_reset_time']
@@ -311,7 +325,7 @@ def detect_ddos(source_ip, source_port):
             connection_stats['suspicious_connections'] += 1
 
             # Logowanie ataku do bazy danych
-            log_attack = from_database_import()
+            log_attack = import_db_handler()
 
             attack_data = {
                 'timestamp': datetime.now().isoformat(),
@@ -334,7 +348,7 @@ def detect_ddos(source_ip, source_port):
                 'ddos_details': {
                     'packets_count': connection_stats['total_connections'],
                     'packet_type': 'HTTP',
-                    'bandwidth_usage': len(request.data) * connection_stats['total_connections'],
+                    'bandwidth_usage': connection_stats['traffic_volume'],
                     'attack_duration': elapsed,
                     'attack_vector': 'HTTP-FLOOD',
                     'packet_distribution': json.dumps({
@@ -347,9 +361,9 @@ def detect_ddos(source_ip, source_port):
                 }
             }
 
-            log_attack(DB_PATH, attack_data)
+            attack_id = log_attack(DB_PATH, attack_data)
             logger.warning(
-                f"Wykryto potencjalny atak DDoS z {source_ip}:{source_port} (rate: {current_rate:.2f} conn/s)")
+                f"Wykryto potencjalny atak DDoS z {source_ip}:{source_port} (rate: {current_rate:.2f} conn/s), ID: {attack_id}")
 
         return is_ddos
 

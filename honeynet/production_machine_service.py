@@ -15,7 +15,7 @@ import time
 import json
 import hashlib
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, render_template_string, g
+from flask import Flask, request, jsonify, render_template_string, g, make_response
 
 # Konfiguracja logowania
 logger = logging.getLogger('honeynet.production')
@@ -162,7 +162,7 @@ CONTROL_PANEL = '''
             font-family: Arial, sans-serif;
             background-color: #2e3440;
             color: #d8dee9;
-            margin: 0;
+            margin:margin: 0;
             padding: 20px;
         }
         .header {
@@ -354,7 +354,7 @@ CONTROL_PANEL = '''
             const logContent = document.getElementById('log-content');
             const entry = document.createElement('div');
             entry.className = `log-entry ${type}`;
-            const timestamp = new time().toLocaleTimeString();
+            const timestamp = new Date().toLocaleTimeString();
             entry.textContent = `[${timestamp}] [${type.toUpperCase()}] ${message}`;
             logContent.appendChild(entry);
             logContent.scrollTop = logContent.scrollHeight;
@@ -375,14 +375,25 @@ CONTROL_PANEL = '''
 '''
 
 
-def from_database_import():
-    """Importuje funkcje z modułu db_handler."""
+def import_db_handler():
+    """Importuje moduł db_handler."""
     import sys
+    import os
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    from honeynet.db_handler import log_attack
-
-    return log_attack
+    
+    try:
+        from honeynet.db_handler import log_attack
+        return log_attack
+    except ImportError as e:
+        logger.error(f"Nie można zaimportować modułu db_handler: {e}")
+        
+        # Funkcja zastępcza w przypadku braku możliwości importu
+        def fallback_log_attack(db_path, attack_data):
+            logger.warning("Używam zastępczej funkcji log_attack!")
+            logger.info(f"Atak: {attack_data.get('attack_type')} z {attack_data.get('source_ip')}")
+            return None
+            
+        return fallback_log_attack
 
 
 def generate_session_id():
@@ -510,10 +521,20 @@ def authenticate():
     # Logowanie próby przejęcia
     with session_lock:
         attempts = session_data['authentication_attempts'][source_ip]['count']
-
-        if attempts > 3 or is_successful:
+        
+        # Aktualizacja informacji o powodzeniu ataku
+        session_data['authentication_attempts'][source_ip]['successful'] = is_successful
+        
+        # Dodanie do licznika prób przejęcia jeśli jest to atak
+        if attempts > 3 or takeover_method != "default_credentials":
+            # Dodaj do statystyk takeover_attempts
+            if source_ip not in session_data['takeover_attempts']:
+                session_data['takeover_attempts'][source_ip] = 0
+            
+            session_data['takeover_attempts'][source_ip] += 1
+            
             # Logowanie ataku do bazy danych
-            log_attack = from_database_import()
+            log_attack = import_db_handler()
 
             attack_data = {
                 'timestamp': datetime.now().isoformat(),
@@ -548,8 +569,8 @@ def authenticate():
                 }
             }
 
-            log_attack(DB_PATH, attack_data)
-            logger.warning(f"Wykryto próbę przejęcia maszyn przez {source_ip} - Metoda: {takeover_method}")
+            attack_id = log_attack(DB_PATH, attack_data)
+            logger.warning(f"Wykryto próbę przejęcia maszyn przez {source_ip} - Metoda: {takeover_method}, ID: {attack_id}")
 
     if is_successful:
         # Utworzenie sesji
@@ -593,7 +614,7 @@ def control_machine(machine_id, command):
 
         # Jeśli wykryto złośliwą komendę, loguj to jako eskalację ataku
         if is_malicious:
-            log_attack = from_database_import()
+            log_attack = import_db_handler()
 
             commands_history = session_data['active_sessions'][session_id]['commands']
             command_sequence = json.dumps(commands_history)
@@ -630,9 +651,9 @@ def control_machine(machine_id, command):
                 }
             }
 
-            log_attack(DB_PATH, attack_data)
+            attack_id = log_attack(DB_PATH, attack_data)
             logger.critical(
-                f"Wykryto wykonanie złośliwej komendy: {command} na maszynie {machine_id} przez {source_ip}")
+                f"Wykryto wykonanie złośliwej komendy: {command} na maszynie {machine_id} przez {source_ip}, ID: {attack_id}")
 
     # Symulacja wykonania komendy
     valid_commands = ['start', 'stop', 'reset', 'status']
