@@ -5,7 +5,7 @@
 Moduł obsługujący bazę danych dla honeynetu.
 Zapisuje szczegółowe informacje o atakach dla wszystkich scenariuszy.
 """
-
+from honeynet.apt_detection import analyze_attack
 import logging
 import os
 import sqlite3
@@ -104,9 +104,25 @@ def init_database(db_path):
     )
     ''')
 
+    # Tabela dla wykrytych grup APT
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS apt_detections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attack_log_id INTEGER,
+        timestamp TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        source_ip TEXT,
+        attack_type TEXT,
+        evidence TEXT,
+        FOREIGN KEY (attack_log_id) REFERENCES attack_logs (id)
+    )
+    ''')
+    
     conn.commit()
     conn.close()
-
+    
     logger.info(f"Baza danych zainicjalizowana: {db_path}")
 
 
@@ -166,6 +182,49 @@ def log_attack(db_path, attack_data):
 
         # Zatwierdzenie transakcji
         conn.commit()
+
+        # Analiza ataku pod kątem grup APT
+        attack_data['id'] = attack_log_id  # Dodanie ID do danych
+        apt_detection = analyze_attack(attack_data)
+        
+        # Jeśli wykryto grupę APT, dodaj wpis do tabeli apt_detections
+        if apt_detection:
+            cursor.execute('''
+            INSERT INTO apt_detections (
+                attack_log_id, timestamp, group_id, group_name, confidence,
+                source_ip, attack_type, evidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                attack_log_id,
+                apt_detection['timestamp'],
+                apt_detection['group_id'],
+                apt_detection['group_name'],
+                apt_detection['confidence'],
+                apt_detection['source_ip'],
+                apt_detection['attack_type'],
+                json.dumps(apt_detection['evidence'])
+            ))
+            
+            # Aktualizacja wpisu ataku o informacje o grupie APT
+            additional_info_dict = json.loads(additional_info)
+            additional_info_dict['apt_detection'] = {
+                'group_id': apt_detection['group_id'],
+                'group_name': apt_detection['group_name'],
+                'confidence': apt_detection['confidence']
+            }
+            
+            cursor.execute('''
+            UPDATE attack_logs 
+            SET additional_info = ? 
+            WHERE id = ?
+            ''', (
+                json.dumps(additional_info_dict),
+                attack_log_id
+            ))
+            
+            conn.commit()
+            
+            logger.warning(f"Wykryto atak grupy APT: {apt_detection['group_name']} (ID: {attack_log_id})")
 
         logger.info(f"Zapisano atak typu {attack_type} (ID: {attack_log_id}) z {source_ip}:{source_port}")
         return attack_log_id
@@ -330,12 +389,42 @@ def get_attack_stats(db_path, start_date=None, end_date=None):
         
         cursor.execute(query, params)
         severity_counts = {severity: count for severity, count in cursor.fetchall()}
+        
+        # Pobranie statystyk grup APT
+        query = """
+        SELECT group_id, group_name, COUNT(*) as count
+        FROM apt_detections
+        """
+        
+        params = []
+        
+        if start_date or end_date:
+            query += " WHERE 1=1"
+            
+            if start_date:
+                query += " AND timestamp >= ?"
+                params.append(start_date)
+                
+            if end_date:
+                query += " AND timestamp <= ?"
+                params.append(end_date)
+                
+        query += " GROUP BY group_id"
+        
+        cursor.execute(query, params)
+        apt_groups = {}
+        for group_id, group_name, count in cursor.fetchall():
+            apt_groups[group_id] = {
+                'name': group_name,
+                'count': count
+            }
 
         stats = {
             'total_attacks': sum(attack_counts.values()),
             'attack_types': attack_counts,
             'unique_sources': unique_sources,
-            'severity_counts': severity_counts
+            'severity_counts': severity_counts,
+            'apt_groups': apt_groups
         }
 
         return stats
@@ -378,6 +467,44 @@ def get_latest_attacks(db_path, limit=10):
         
     except sqlite3.Error as e:
         logger.error(f"Błąd podczas pobierania ostatnich ataków: {e}")
+        return []
+        
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_apt_detections(db_path, limit=10):
+    """
+    Pobiera ostatnie wykrycia grup APT.
+
+    Args:
+        db_path (str): Ścieżka do pliku bazy danych
+        limit (int): Limit wyników
+
+    Returns:
+        list: Lista ostatnich wykryć grup APT
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT a.*, l.attack_type, l.source_ip, l.destination_ip, l.protocol, l.severity
+        FROM apt_detections a
+        JOIN attack_logs l ON a.attack_log_id = l.id
+        ORDER BY a.id DESC
+        LIMIT ?
+        """
+        
+        cursor.execute(query, (limit,))
+        detections = cursor.fetchall()
+        
+        return [dict(detection) for detection in detections]
+        
+    except sqlite3.Error as e:
+        logger.error(f"Błąd podczas pobierania wykryć APT: {e}")
         return []
         
     finally:
@@ -456,6 +583,50 @@ def get_attack_timeline(db_path, interval='hour', start_date=None, end_date=None
             elif attack_type == 'machine_takeover':
                 timeline[time_period]['machine_takeover'] += count
         
+        # Dodajmy również oś czasu wykryć APT
+        apt_query = f"""
+        SELECT {time_group} as time_period, group_id, COUNT(*) as count
+        FROM apt_detections
+        """
+        
+        apt_params = []
+        
+        if start_date or end_date:
+            apt_query += " WHERE 1=1"
+            
+            if start_date:
+                apt_query += " AND timestamp >= ?"
+                apt_params.append(start_date)
+                
+            if end_date:
+                apt_query += " AND timestamp <= ?"
+                apt_params.append(end_date)
+                
+        apt_query += f" GROUP BY {time_group}, group_id ORDER BY {time_group}"
+        
+        cursor.execute(apt_query, apt_params)
+        apt_results = cursor.fetchall()
+        
+        # Dodajmy wykrycia APT do osi czasu
+        for time_period, group_id, count in apt_results:
+            if time_period in timeline:
+                if 'apt_groups' not in timeline[time_period]:
+                    timeline[time_period]['apt_groups'] = {}
+                
+                timeline[time_period]['apt_groups'][group_id] = count
+            else:
+                # Jeśli nie ma jeszcze tego okresu w osi czasu
+                timeline[time_period] = {
+                    'time': time_period,
+                    'total': 0,
+                    'ddos': 0,
+                    'sql_injection': 0,
+                    'machine_takeover': 0,
+                    'apt_groups': {
+                        group_id: count
+                    }
+                }
+        
         # Konwersja do listy
         return list(timeline.values())
         
@@ -515,6 +686,64 @@ def search_attacks(db_path, search_term, start_date=None, end_date=None, limit=1
         
     except sqlite3.Error as e:
         logger.error(f"Błąd podczas wyszukiwania ataków: {e}")
+        return []
+        
+    finally:
+        if conn:
+            conn.close()
+
+
+def search_apt_detections(db_path, group_id=None, min_confidence=0.0, start_date=None, end_date=None, limit=100):
+    """
+    Wyszukuje wykrycia grup APT.
+    
+    Args:
+        db_path (str): Ścieżka do pliku bazy danych
+        group_id (str, optional): ID grupy APT
+        min_confidence (float): Minimalny poziom pewności wykrycia
+        start_date (str, optional): Data początkowa w formacie ISO
+        end_date (str, optional): Data końcowa w formacie ISO
+        limit (int): Limit wyników
+        
+    Returns:
+        list: Lista znalezionych wykryć
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT a.*, l.attack_type, l.source_ip, l.destination_ip, l.severity
+        FROM apt_detections a
+        JOIN attack_logs l ON a.attack_log_id = l.id
+        WHERE confidence >= ?
+        """
+        
+        params = [min_confidence]
+        
+        if group_id:
+            query += " AND group_id = ?"
+            params.append(group_id)
+        
+        if start_date:
+            query += " AND a.timestamp >= ?"
+            params.append(start_date)
+            
+        if end_date:
+            query += " AND a.timestamp <= ?"
+            params.append(end_date)
+            
+        query += " ORDER BY a.id DESC LIMIT ?"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        detections = cursor.fetchall()
+        
+        return [dict(detection) for detection in detections]
+        
+    except sqlite3.Error as e:
+        logger.error(f"Błąd podczas wyszukiwania wykryć APT: {e}")
         return []
         
     finally:

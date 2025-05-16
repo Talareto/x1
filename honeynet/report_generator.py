@@ -116,6 +116,21 @@ HTML_TEMPLATE = """
         .chart-container {
             margin-bottom: 30px;
         }
+        .apt-blacknova {
+            color: #dc3545;
+        }
+        .apt-silkroad {
+            color: #fd7e14;
+        }
+        .apt-ghostprotocol {
+            color: #6f42c1;
+        }
+        .apt-redshift {
+            color: #007bff;
+        }
+        .apt-cosmicspider {
+            color: #20c997;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -147,6 +162,10 @@ HTML_TEMPLATE = """
                 <h4>Unikalne źródła</h4>
                 <div class="number">{{ stats.unique_sources }}</div>
             </div>
+            <div class="stat-box">
+                <h4>Wykryte grupy APT</h4>
+                <div class="number">{{ stats.apt_detections }}</div>
+            </div>
         </div>
 
         <div class="charts">
@@ -164,6 +183,13 @@ HTML_TEMPLATE = """
                 <h3>Poziomy krytyczności</h3>
                 <canvas id="severityChart" width="400" height="200"></canvas>
             </div>
+            
+            {% if stats.apt_detections > 0 %}
+            <div class="chart-container">
+                <h3>Rozkład grup APT</h3>
+                <canvas id="aptGroupsChart" width="400" height="200"></canvas>
+            </div>
+            {% endif %}
         </div>
 
         <h2>Szczegółowe dane ataków</h2>
@@ -176,7 +202,7 @@ HTML_TEMPLATE = """
                     <th>Cel</th>
                     <th>Protokół</th>
                     <th>Krytyczność</th>
-                    <th>Wzorce</th>
+                    <th>Grupa APT</th>
                 </tr>
             </thead>
             <tbody>
@@ -188,7 +214,7 @@ HTML_TEMPLATE = """
                     <td>{{ attack.destination_ip }}:{{ attack.destination_port }}</td>
                     <td>{{ attack.protocol }}</td>
                     <td class="severity-{{ attack.severity }}">{{ attack.severity }}</td>
-                    <td>{{ attack.detected_patterns }}</td>
+                    <td class="apt-{{ attack.apt_group_id | lower if attack.apt_group_id else '' }}">{{ attack.apt_group_name if attack.apt_group_name else 'Brak' }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -213,6 +239,52 @@ HTML_TEMPLATE = """
                 {% endfor %}
             </tbody>
         </table>
+
+        {% if stats.apt_detections > 0 %}
+        <h2>Wykryte grupy APT</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Grupa APT</th>
+                    <th>Liczba wykryć</th>
+                    <th>Procent wszystkich ataków</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for group in apt_groups %}
+                <tr>
+                    <td class="apt-{{ group.group_id | lower }}"><strong>{{ group.group_name }}</strong></td>
+                    <td>{{ group.count }}</td>
+                    <td>{{ "%.1f"|format(group.percentage) }}%</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <h2>Najnowsze wykrycia grup APT</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Czas</th>
+                    <th>Grupa APT</th>
+                    <th>Pewność</th>
+                    <th>Typ ataku</th>
+                    <th>Źródło IP</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for detection in apt_detections %}
+                <tr>
+                    <td>{{ detection.timestamp }}</td>
+                    <td class="apt-{{ detection.group_id | lower }}"><strong>{{ detection.group_name }}</strong></td>
+                    <td>{{ "%.2f"|format(detection.confidence) }}</td>
+                    <td>{{ detection.attack_type }}</td>
+                    <td>{{ detection.source_ip }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
     </div>
 
     <script>
@@ -285,6 +357,33 @@ HTML_TEMPLATE = """
                 }
             }
         });
+        
+        {% if stats.apt_detections > 0 %}
+        // Wykres grup APT
+        const aptGroupsCtx = document.getElementById('aptGroupsChart').getContext('2d');
+        new Chart(aptGroupsCtx, {
+            type: 'pie',
+            data: {
+                labels: {{ apt_group_labels | tojson }},
+                datasets: [{
+                    data: {{ apt_group_counts | tojson }},
+                    backgroundColor: ['#dc3545', '#fd7e14', '#6f42c1', '#007bff', '#20c997']
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'top',
+                    },
+                    title: {
+                        display: true,
+                        text: 'Wykryte grupy APT'
+                    }
+                }
+            }
+        });
+        {% endif %}
     </script>
 </body>
 </html>
@@ -300,6 +399,7 @@ def parse_arguments():
     parser.add_argument('--to-date', type=str, help='Data końcowa (YYYY-MM-DD)')
     parser.add_argument('--output', type=str, help='Ścieżka do pliku wyjściowego')
     parser.add_argument('--db', type=str, default=DB_PATH, help='Ścieżka do bazy danych')
+    parser.add_argument('--apt-only', action='store_true', help='Generuj raport tylko o grupach APT')
 
     return parser.parse_args()
 
@@ -354,12 +454,114 @@ def get_attack_data(db_path, from_date=None, to_date=None):
 
         cursor.execute(query, params)
         attacks = cursor.fetchall()
+        
+        # Pobierz informacje o grupach APT dla każdego ataku
+        attacks_with_apt = []
+        for attack in attacks:
+            attack_dict = dict(attack)
+            
+            # Sprawdź czy atak ma przypisaną grupę APT
+            apt_query = """
+            SELECT * FROM apt_detections
+            WHERE attack_log_id = ?
+            """
+            
+            cursor.execute(apt_query, (attack_dict['id'],))
+            apt_detection = cursor.fetchone()
+            
+            if apt_detection:
+                apt_dict = dict(apt_detection)
+                attack_dict['apt_group_id'] = apt_dict['group_id']
+                attack_dict['apt_group_name'] = apt_dict['group_name']
+                attack_dict['apt_confidence'] = apt_dict['confidence']
+            else:
+                attack_dict['apt_group_id'] = None
+                attack_dict['apt_group_name'] = None
+                attack_dict['apt_confidence'] = None
+                
+            attacks_with_apt.append(attack_dict)
 
-        return [dict(attack) for attack in attacks]
+        return attacks_with_apt
 
     except sqlite3.Error as e:
         logger.error(f"Błąd podczas pobierania danych: {e}")
         return []
+
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_apt_data(db_path, from_date=None, to_date=None):
+    """
+    Pobiera dane o wykrytych grupach APT.
+
+    Args:
+        db_path (str): Ścieżka do bazy danych
+        from_date (str): Data początkowa
+        to_date (str): Data końcowa
+
+    Returns:
+        dict: Dane o grupach APT
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Pobierz statystyki grup APT
+        query = """
+        SELECT group_id, group_name, COUNT(*) as count
+        FROM apt_detections
+        WHERE 1=1
+        """
+
+        params = []
+
+        if from_date:
+            query += " AND timestamp >= ?"
+            params.append(from_date)
+
+        if to_date:
+            query += " AND timestamp <= ?"
+            params.append(to_date)
+
+        query += " GROUP BY group_id"
+
+        cursor.execute(query, params)
+        groups_stats = cursor.fetchall()
+
+        # Pobierz najnowsze wykrycia
+        query = """
+        SELECT a.*, l.attack_type, l.source_ip, l.destination_ip
+        FROM apt_detections a
+        JOIN attack_logs l ON a.attack_log_id = l.id
+        WHERE 1=1
+        """
+
+        params = []
+
+        if from_date:
+            query += " AND a.timestamp >= ?"
+            params.append(from_date)
+
+        if to_date:
+            query += " AND a.timestamp <= ?"
+            params.append(to_date)
+
+        query += " ORDER BY a.timestamp DESC LIMIT 20"
+
+        cursor.execute(query, params)
+        recent_detections = cursor.fetchall()
+
+        return {
+            'groups': [dict(g) for g in groups_stats],
+            'recent_detections': [dict(d) for d in recent_detections]
+        }
+
+    except sqlite3.Error as e:
+        logger.error(f"Błąd podczas pobierania danych APT: {e}")
+        return {'groups': [], 'recent_detections': []}
 
     finally:
         if conn:
@@ -385,7 +587,9 @@ def get_statistics(attacks):
         'severity_critical': 0,
         'severity_high': 0,
         'severity_medium': 0,
-        'severity_low': 0
+        'severity_low': 0,
+        'apt_detections': 0,
+        'apt_groups': {}
     }
 
     for attack in attacks:
@@ -411,6 +615,19 @@ def get_statistics(attacks):
             stats['severity_medium'] += 1
         elif severity == 'low':
             stats['severity_low'] += 1
+            
+        # Zliczanie grup APT
+        apt_group_id = attack.get('apt_group_id')
+        if apt_group_id:
+            stats['apt_detections'] += 1
+            
+            if apt_group_id not in stats['apt_groups']:
+                stats['apt_groups'][apt_group_id] = {
+                    'name': attack.get('apt_group_name', ''),
+                    'count': 0
+                }
+                
+            stats['apt_groups'][apt_group_id]['count'] += 1
 
     stats['unique_sources'] = len(stats['unique_sources'])
 
@@ -484,6 +701,38 @@ def get_timeline_data(attacks):
     return labels, data
 
 
+def get_apt_groups_for_report(attacks_stats, apt_data):
+    """
+    Przygotowuje dane o grupach APT do raportu.
+
+    Args:
+        attacks_stats (dict): Statystyki ataków
+        apt_data (dict): Dane o grupach APT
+
+    Returns:
+        list: Lista danych o grupach APT
+    """
+    apt_groups = []
+    total_attacks = attacks_stats['total_attacks']
+    
+    for group in apt_data['groups']:
+        group_id = group['group_id']
+        group_name = group['group_name']
+        count = group['count']
+        
+        apt_groups.append({
+            'group_id': group_id,
+            'group_name': group_name,
+            'count': count,
+            'percentage': (count / total_attacks * 100) if total_attacks > 0 else 0
+        })
+        
+    # Sortowanie według liczby wykryć
+    apt_groups.sort(key=lambda x: x['count'], reverse=True)
+    
+    return apt_groups
+
+
 def generate_csv(attacks, output_file):
     """
     Generuje raport w formacie CSV.
@@ -497,7 +746,7 @@ def generate_csv(attacks, output_file):
             fieldnames = [
                 'timestamp', 'source_ip', 'source_port', 'destination_ip',
                 'destination_port', 'attack_type', 'protocol', 'severity',
-                'detected_patterns', 'session_id'
+                'detected_patterns', 'session_id', 'apt_group_id', 'apt_group_name', 'apt_confidence'
             ]
 
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
@@ -510,6 +759,33 @@ def generate_csv(attacks, output_file):
 
     except Exception as e:
         logger.error(f"Błąd podczas generowania CSV: {e}")
+
+
+def generate_apt_csv(apt_data, output_file):
+    """
+    Generuje raport w formacie CSV tylko dla grup APT.
+
+    Args:
+        apt_data (dict): Dane o grupach APT
+        output_file (str): Ścieżka do pliku wyjściowego
+    """
+    try:
+        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = [
+                'timestamp', 'group_id', 'group_name', 'confidence',
+                'attack_type', 'source_ip', 'attack_log_id'
+            ]
+
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+
+            for detection in apt_data['recent_detections']:
+                writer.writerow(detection)
+
+        logger.info(f"Raport APT CSV zapisany: {output_file}")
+
+    except Exception as e:
+        logger.error(f"Błąd podczas generowania CSV APT: {e}")
 
 
 def generate_json(attacks, stats, output_file):
@@ -537,6 +813,35 @@ def generate_json(attacks, stats, output_file):
         logger.error(f"Błąd podczas generowania JSON: {e}")
 
 
+def generate_apt_json(apt_data, stats, output_file):
+    """
+    Generuje raport w formacie JSON tylko dla grup APT.
+
+    Args:
+        apt_data (dict): Dane o grupach APT
+        stats (dict): Statystyki
+        output_file (str): Ścieżka do pliku wyjściowego
+    """
+    try:
+        report_data = {
+            'generation_time': datetime.now().isoformat(),
+            'statistics': {
+                'total_apt_detections': sum(group['count'] for group in apt_data['groups']),
+                'apt_groups': {group['group_id']: group['count'] for group in apt_data['groups']}
+            },
+            'apt_groups': apt_data['groups'],
+            'recent_detections': apt_data['recent_detections']
+        }
+
+        with open(output_file, 'w', encoding='utf-8') as jsonfile:
+            json.dump(report_data, jsonfile, indent=4, ensure_ascii=False)
+
+        logger.info(f"Raport APT JSON zapisany: {output_file}")
+
+    except Exception as e:
+        logger.error(f"Błąd podczas generowania JSON APT: {e}")
+
+
 def generate_html(attacks, stats, from_date, to_date, output_file):
     """
     Generuje raport w formacie HTML.
@@ -557,6 +862,14 @@ def generate_html(attacks, stats, from_date, to_date, output_file):
                 'machine_takeover': 'Machine Takeover'
             }.get(attack.get('attack_type', ''), attack.get('attack_type', ''))
 
+        # Pobierz dane o grupach APT
+        apt_data = get_apt_data(args.db, from_date, to_date)
+        apt_groups = get_apt_groups_for_report(stats, apt_data)
+        
+        # Przygotuj dane dla wykresu grup APT
+        apt_group_labels = [group['group_name'] for group in apt_groups]
+        apt_group_counts = [group['count'] for group in apt_groups]
+
         top_sources = get_top_sources(attacks)
         timeline_labels, timeline_data = get_timeline_data(attacks)
 
@@ -569,7 +882,11 @@ def generate_html(attacks, stats, from_date, to_date, output_file):
             attacks=attacks,
             top_sources=top_sources,
             timeline_labels=timeline_labels,
-            timeline_data=timeline_data
+            timeline_data=timeline_data,
+            apt_groups=apt_groups,
+            apt_detections=apt_data['recent_detections'],
+            apt_group_labels=apt_group_labels,
+            apt_group_counts=apt_group_counts
         )
 
         with open(output_file, 'w', encoding='utf-8') as htmlfile:
@@ -581,8 +898,322 @@ def generate_html(attacks, stats, from_date, to_date, output_file):
         logger.error(f"Błąd podczas generowania HTML: {e}")
 
 
+def generate_apt_html(apt_data, from_date, to_date, output_file):
+    """
+    Generuje raport w formacie HTML tylko dla grup APT.
+
+    Args:
+        apt_data (dict): Dane o grupach APT
+        from_date (str): Data początkowa
+        to_date (str): Data końcowa
+        output_file (str): Ścieżka do pliku wyjściowego
+    """
+    try:
+        # Przygotuj dane dla wykresu grup APT
+        apt_group_labels = [group['group_name'] for group in apt_data['groups']]
+        apt_group_counts = [group['count'] for group in apt_data['groups']]
+        
+        # Oblicz procent dla każdej grupy
+        total_detections = sum(group['count'] for group in apt_data['groups'])
+        for group in apt_data['groups']:
+            group['percentage'] = (group['count'] / total_detections * 100) if total_detections > 0 else 0
+        
+        # Sortowanie według liczby wykryć
+        apt_data['groups'].sort(key=lambda x: x['count'], reverse=True)
+        
+        # Przygotowanie oś czasu wykryć
+        timeline = {}
+        for detection in apt_data['recent_detections']:
+            timestamp = detection.get('timestamp', '')
+            if timestamp:
+                # Grupowanie po dniach
+                day = timestamp[:10]  # YYYY-MM-DD
+                if day not in timeline:
+                    timeline[day] = {}
+                
+                group_id = detection.get('group_id', '')
+                if group_id not in timeline[day]:
+                    timeline[day][group_id] = 0
+                    
+                timeline[day][group_id] += 1
+        
+        # Przygotuj dane dla wykresu osi czasu
+        timeline_labels = sorted(timeline.keys())
+        timeline_datasets = []
+        
+        # Kolory dla grup APT
+        colors = {
+            'BlackNova': '#dc3545',
+            'SilkRoad': '#fd7e14',
+            'GhostProtocol': '#6f42c1',
+            'RedShift': '#007bff',
+            'CosmicSpider': '#20c997'
+        }
+        
+        # Tworzenie dataset dla każdej grupy
+        for group in apt_data['groups']:
+            group_id = group['group_id']
+            dataset = {
+                'label': group['group_name'],
+                'data': [timeline.get(day, {}).get(group_id, 0) for day in timeline_labels],
+                'borderColor': colors.get(group_id, '#000000'),
+                'backgroundColor': colors.get(group_id, '#000000'),
+                'tension': 0.1
+            }
+            timeline_datasets.append(dataset)
+        
+        # Tworzenie szablonu HTML dla raportu APT
+        apt_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Raport wykrytych grup APT</title>
+            <meta charset="UTF-8">
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    margin: 20px;
+                    background-color: #f5f5f5;
+                }
+                .container {
+                    max-width: 1200px;
+                    margin: 0 auto;
+                    background-color: white;
+                    padding: 20px;
+                    border-radius: 10px;
+                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                }
+                h1, h2, h3 {
+                    color: #333;
+                }
+                .summary {
+                    background-color: #f8f9fa;
+                    padding: 15px;
+                    border-radius: 5px;
+                    margin-bottom: 20px;
+                }
+                .stat-box {
+                    display: inline-block;
+                    background-color: #e9ecef;
+                    padding: 10px 20px;
+                    margin: 10px;
+                    border-radius: 5px;
+                    text-align: center;
+                }
+                .stat-box h4 {
+                    margin: 0;
+                    color: #495057;
+                }
+                .stat-box .number {
+                    font-size: 24px;
+                    font-weight: bold;
+                    color: #007bff;
+                }
+                table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    margin-top: 20px;
+                }
+                th, td {
+                    border: 1px solid #ddd;
+                    padding: 8px;
+                    text-align: left;
+                }
+                th {
+                    background-color: #007bff;
+                    color: white;
+                }
+                tr:nth-child(even) {
+                    background-color: #f2f2f2;
+                }
+                .charts {
+                    margin-top: 30px;
+                }
+                .chart-container {
+                    margin-bottom: 30px;
+                }
+                .apt-blacknova {
+                    color: #dc3545;
+                }
+                .apt-silkroad {
+                    color: #fd7e14;
+                }
+                .apt-ghostprotocol {
+                    color: #6f42c1;
+                }
+                .apt-redshift {
+                    color: #007bff;
+                }
+                .apt-cosmicspider {
+                    color: #20c997;
+                }
+            </style>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Raport wykrytych grup APT</h1>
+                <p>Wygenerowano: {{ generation_time }}</p>
+                <p>Okres: {{ date_from }} - {{ date_to }}</p>
+
+                <div class="summary">
+                    <h2>Podsumowanie</h2>
+                    <div class="stat-box">
+                        <h4>Wykryte grupy APT</h4>
+                        <div class="number">{{ apt_groups|length }}</div>
+                    </div>
+                    <div class="stat-box">
+                        <h4>Całkowita liczba wykryć</h4>
+                        <div class="number">{{ total_detections }}</div>
+                    </div>
+                </div>
+
+                <div class="charts">
+                    <div class="chart-container">
+                        <h3>Rozkład grup APT</h3>
+                        <canvas id="aptGroupsChart" width="400" height="200"></canvas>
+                    </div>
+
+                    <div class="chart-container">
+                        <h3>Wykrycia w czasie</h3>
+                        <canvas id="detectionsTimelineChart" width="800" height="300"></canvas>
+                    </div>
+                </div>
+
+                <h2>Statystyki grup APT</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Grupa APT</th>
+                            <th>Liczba wykryć</th>
+                            <th>Procent</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for group in apt_groups %}
+                        <tr>
+                            <td class="apt-{{ group.group_id | lower }}"><strong>{{ group.group_name }}</strong></td>
+                            <td>{{ group.count }}</td>
+                            <td>{{ "%.1f"|format(group.percentage) }}%</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+
+                <h2>Najnowsze wykrycia grup APT</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Czas</th>
+                            <th>Grupa APT</th>
+                            <th>Pewność</th>
+                            <th>Typ ataku</th>
+                            <th>Źródło IP</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for detection in recent_detections %}
+                        <tr>
+                            <td>{{ detection.timestamp }}</td>
+                            <td class="apt-{{ detection.group_id | lower }}"><strong>{{ detection.group_name }}</strong></td>
+                            <td>{{ "%.2f"|format(detection.confidence) }}</td>
+                            <td>{{ detection.attack_type }}</td>
+                            <td>{{ detection.source_ip }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+
+            <script>
+                // Wykres grup APT
+                const aptGroupsCtx = document.getElementById('aptGroupsChart').getContext('2d');
+                new Chart(aptGroupsCtx, {
+                    type: 'pie',
+                    data: {
+                        labels: {{ apt_group_labels | tojson }},
+                        datasets: [{
+                            data: {{ apt_group_counts | tojson }},
+                            backgroundColor: ['#dc3545', '#fd7e14', '#6f42c1', '#007bff', '#20c997']
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        plugins: {
+                            legend: {
+                                position: 'top',
+                            },
+                            title: {
+                                display: true,
+                                text: 'Wykryte grupy APT'
+                            }
+                        }
+                    }
+                });
+
+                // Wykres osi czasu wykryć
+                const timelineCtx = document.getElementById('detectionsTimelineChart').getContext('2d');
+                new Chart(timelineCtx, {
+                    type: 'line',
+                    data: {
+                        labels: {{ timeline_labels | tojson }},
+                        datasets: {{ timeline_datasets | tojson }}
+                    },
+                    options: {
+                        responsive: true,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                stacked: false
+                            },
+                            x: {
+                                grid: {
+                                    display: false
+                                }
+                            }
+                        },
+                        plugins: {
+                            legend: {
+                                position: 'top'
+                            },
+                            title: {
+                                display: true,
+                                text: 'Wykrycia grup APT w czasie'
+                            }
+                        }
+                    }
+                });
+            </script>
+        </body>
+        </html>
+        """
+        
+        template = Template(apt_template)
+        html_content = template.render(
+            generation_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            date_from=from_date or 'początek',
+            date_to=to_date or 'teraz',
+            apt_groups=apt_data['groups'],
+            total_detections=sum(group['count'] for group in apt_data['groups']),
+            recent_detections=apt_data['recent_detections'],
+            apt_group_labels=apt_group_labels,
+            apt_group_counts=apt_group_counts,
+            timeline_labels=timeline_labels,
+            timeline_datasets=timeline_datasets
+        )
+
+        with open(output_file, 'w', encoding='utf-8') as htmlfile:
+            htmlfile.write(html_content)
+
+        logger.info(f"Raport APT HTML zapisany: {output_file}")
+
+    except Exception as e:
+        logger.error(f"Błąd podczas generowania HTML APT: {e}")
+
+
 def main():
     """Główna funkcja programu."""
+    global args
     args = parse_arguments()
 
     # Weryfikacja formatów dat
@@ -600,31 +1231,49 @@ def main():
             logger.error("Nieprawidłowy format daty końcowej. Użyj formatu YYYY-MM-DD")
             return
 
-    # Pobranie danych z bazy
-    logger.info("Pobieranie danych z bazy...")
-    attacks = get_attack_data(args.db, args.from_date, args.to_date)
-
-    if not attacks:
-        logger.warning("Brak danych do wygenerowania raportu")
-        return
-
-    logger.info(f"Znaleziono {len(attacks)} ataków")
-
-    # Obliczanie statystyk
-    stats = get_statistics(attacks)
-
     # Generowanie pliku wyjściowego
     if not args.output:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         args.output = f"attack_report_{timestamp}.{args.format}"
 
-    # Generowanie raportu w odpowiednim formacie
-    if args.format == 'csv':
-        generate_csv(attacks, args.output)
-    elif args.format == 'json':
-        generate_json(attacks, stats, args.output)
-    elif args.format == 'html':
-        generate_html(attacks, stats, args.from_date, args.to_date, args.output)
+    if args.apt_only:
+        # Pobierz dane tylko o grupach APT
+        apt_data = get_apt_data(args.db, args.from_date, args.to_date)
+        
+        if not apt_data['groups']:
+            logger.warning("Brak danych o grupach APT do wygenerowania raportu")
+            return
+            
+        logger.info(f"Znaleziono {len(apt_data['groups'])} grup APT, {len(apt_data['recent_detections'])} wykryć")
+        
+        # Generowanie raportu o grupach APT w odpowiednim formacie
+        if args.format == 'csv':
+            generate_apt_csv(apt_data, args.output)
+        elif args.format == 'json':
+            generate_apt_json(apt_data, {}, args.output)
+        elif args.format == 'html':
+            generate_apt_html(apt_data, args.from_date, args.to_date, args.output)
+    else:
+        # Standardowe generowanie raportu
+        logger.info("Pobieranie danych z bazy...")
+        attacks = get_attack_data(args.db, args.from_date, args.to_date)
+
+        if not attacks:
+            logger.warning("Brak danych do wygenerowania raportu")
+            return
+
+        logger.info(f"Znaleziono {len(attacks)} ataków")
+
+        # Obliczanie statystyk
+        stats = get_statistics(attacks)
+
+        # Generowanie raportu w odpowiednim formacie
+        if args.format == 'csv':
+            generate_csv(attacks, args.output)
+        elif args.format == 'json':
+            generate_json(attacks, stats, args.output)
+        elif args.format == 'html':
+            generate_html(attacks, stats, args.from_date, args.to_date, args.output)
 
     logger.info("Generowanie raportu zakończone")
 
